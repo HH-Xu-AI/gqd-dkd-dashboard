@@ -1,0 +1,654 @@
+{
+  "meta": {
+    "project": "葛根芩连汤 → 糖尿病肾病(DKD) 中药1.1类新药",
+    "code": "GQD-DKD-MVP",
+    "version": "2.0.0",
+    "date": "2026-07-06",
+    "architect": "Linkbot数据架构师",
+    "architecture": "知识图谱核心 + 向量增强 + Pipeline接入(KG-Centric)",
+    "status": "MVP虚拟孪生跑通实例 v2.0（6项重构后）",
+    "dataScale": {"summary": "~120KB", "full": "~3.5MB(50万条记录)", "blocks": 12, "gates": 3, "feedbackLoops": 7}
+  },
+  "architecture": {
+    "name": "三层混合For AI数据架构（KG-Centric）",
+    "layers": [
+      {
+        "id": "L1",
+        "name": "事实层（PostgreSQL）",
+        "role": "结构化数值事实存储——所有实验原始数据的家",
+        "stores": ["SMILES分子结构", "IC50/AUC数值", "HPLC含量", "PK参数", "剂量数据", "组学表达矩阵", "病理图像量化"],
+        "design": "每个数值带unit/confidence/evidence_level/provenance四元组",
+        "scale": "~50万条记录",
+        "ports": {
+          "input": ["湿实验仪器导出(CSV/Excel)", "外部数据库API(TCMSP/PubChem/ChEMBL)", "文献抽取结构化数据"],
+          "processing": ["Airflow DAG自动化ETL", "数据校验规则引擎", "单位标准化/缺失值标记"],
+          "output": ["结构化表给L2图谱消费", "汇总统计给前端展示", "原始数据给full下载"]
+        }
+      },
+      {
+        "id": "L2",
+        "name": "知识层（属性图 Apache AGE/Neo4j）",
+        "role": "语义关系网络——AI推理的主干",
+        "stores": ["切块状态机", "实验-数据-结论链条", "成分-靶点-通路-疾病网络", "反馈回路", "配伍关系"],
+        "design": "每个节点/边带provenance/confidence/version；边类型包括produces/proves/regulates/feeds_back_to/blocks/synergizes_with/antagonizes",
+        "scale": "~2万节点 + ~8万边",
+        "ports": {
+          "input": ["L1事实层数据触发图谱更新", "AI Agent推理结果写入", "人审决策信号写入"],
+          "processing": ["图查询(Cypher)", "路径推理", "环路检测(反馈回路)", "置信度传播"],
+          "output": ["GraphRAG混合检索结果", "反馈回路触发信号", "切块状态更新"]
+        }
+      },
+      {
+        "id": "L3",
+        "name": "检索层（向量库 Chroma）",
+        "role": "文献/报告语义检索——GraphRAG的向量半",
+        "stores": ["文献摘要embedding", "实验报告embedding", "专家知识embedding"],
+        "design": "与L2图谱节点做linked-data对齐，支持GraphRAG混合检索",
+        "scale": "~1万文档 × 1536维向量",
+        "ports": {
+          "input": ["文献PDF抽取文本", "实验报告全文", "专家规则文本"],
+          "processing": ["文本切块(chunk 512 token)", "embedding生成", "ANN索引(HNSW)"],
+          "output": ["相似文献TopK", "GraphRAG融合检索结果"]
+        }
+      }
+    ],
+    "pipeline": {
+      "role": "数据接入层（降级后的B1 Pipeline）",
+      "tech": "Airflow/Prefect",
+      "function": "自动化采集127个外部数据库+湿实验数据+文献→写入L1+L2+L3",
+      "note": "Pipeline只管'喂'，不管'推理'——推理由AI Agent基于图谱完成"
+    },
+    "aiConsumption": {
+      "vectorRetrieval": "L3向量库 → 相似文献/报告召回",
+      "graphQuery": "L2图谱 → 成分-靶点-通路多跳推理",
+      "graphRAG": "L2+L3融合 → 先图查询定位子图，再向量检索补充语义",
+      "multiOmicsIntegration": "L1组学矩阵 → 多组学因子分析(MOFA) → 跨组学一致性网络 → 新通路发现 → 写入L2图谱(feedback loop)"
+    }
+  },
+  "blocks": [
+    {
+      "id": "B1",
+      "phase": "质量",
+      "name": "药材基源与质量控制",
+      "question": "4味药材是否稳定可控？",
+      "goal": "建立4味药材×3批次的质量标准，锁定投料规格",
+      "experiment": "HPLC指纹图谱 + 多批次含量测定（葛根/黄芩/黄连/甘草各3批次）",
+      "dataType": "质量数据",
+      "dataSummary": "4味药材×3批次×8个指标成分 = 96条HPLC含量记录 + 12张指纹图谱",
+      "passRule": {"metric": "RSD<5% & 指纹图谱相似度>0.9", "autoTrigger": true},
+      "status": "approved",
+      "aiRole": "HPLC数据自动采集/质量评分/批次聚类异常检测",
+      "humanRole": "异常批次判定（仅当AI标记时介入）",
+      "reviewGate": null,
+      "ports": {
+        "input": {
+          "upstream": [],
+          "external": ["药典委标准", "TCSP药材数据库", "HPLC仪器导出CSV"],
+          "schema": "herb_name, batch_id, compound, content_mg_g, rsd_pct, fingerprint_sim"
+        },
+        "processing": {
+          "aiRules": ["RSD<5% → auto_pass", "相似度>0.9 → auto_pass", "聚类离群点>2σ → flag_human"],
+          "models": ["批次聚类(Isolation Forest)", "指纹图谱相似度计算"]
+        },
+        "output": {
+          "toDownstream": ["B2(锁定投料规格)", "B3(成分定量基线)"],
+          "toKnowledge": ["L2: Herb节点+batch属性+quality_score边"],
+          "decisionSignal": "pass/fail → 状态机"
+        }
+      },
+      "virtualData_summary": {
+        "herbs": 4, "batches": 12, "compounds": 8, "totalRecords": 96,
+        "allPassed": true, "avgRSD": 2.8, "avgFingerprintSim": 0.94,
+        "confidence": 0.95
+      }
+    },
+    {
+      "id": "B2",
+      "phase": "质量",
+      "name": "提取工艺优化",
+      "question": "最优提取工艺参数是什么？",
+      "goal": "确定工业化可行的提取工艺，锁定关键参数",
+      "experiment": "正交试验L9(3^4)：乙醇浓度/料液比/提取时间/提取次数",
+      "dataType": "工艺数据",
+      "dataSummary": "9组正交试验×4因素3水平×8成分转移率 = 72条工艺记录",
+      "passRule": {"metric": "主要成分转移率>70%", "autoTrigger": true},
+      "status": "approved",
+      "aiRole": "响应面分析/工艺参数贝叶斯优化/转移率预测",
+      "humanRole": "工艺参数最终确认",
+      "reviewGate": null,
+      "ports": {
+        "input": {
+          "upstream": ["B1(投料规格)"],
+          "external": ["正交试验设计表"],
+          "schema": "run_id, ethanol_pct, ratio, time_min, cycles, compound, transfer_pct, yield_pct"
+        },
+        "processing": {
+          "aiRules": ["转移率>70% → auto_pass", "预测R²>0.9 → 优化可信"],
+          "models": ["响应面回归", "贝叶斯优化(BoTorch)"]
+        },
+        "output": {
+          "toDownstream": ["B3(提取液供成分分析)", "G1(工艺可行性维度)"],
+          "toKnowledge": ["L2: Process节点+optimized_params"]
+        }
+      },
+      "virtualData_summary": {
+        "runs": 9, "compounds": 8, "totalRecords": 72,
+        "optimalParams": {"ethanol_pct": 70, "ratio": "1:12", "time_min": 90, "cycles": 2},
+        "avgTransferRate": 80.4, "extractYield": 18.7,
+        "confidence": 0.92
+      }
+    },
+    {
+      "id": "B3",
+      "phase": "质量",
+      "name": "成分群鉴定与定量",
+      "question": "原料药中含哪些成分？含量多少？",
+      "goal": "建立完整成分清单和UPLC-MS/MS定量方法",
+      "experiment": "UPLC-MS/MS定性+定量",
+      "dataType": "成分数据",
+      "dataSummary": "定性35个成分，定量15个主要成分；每个成分3批次×2技术重复 = 90条定量记录",
+      "passRule": {"metric": "至少定量12个主要成分", "autoTrigger": true},
+      "status": "approved",
+      "aiRole": "质谱数据自动解析/分子网络(Molecular Networking)/成分鉴定",
+      "humanRole": "新化合物结构确认（仅当AI无法鉴定时）",
+      "reviewGate": "H1",
+      "ports": {
+        "input": {
+          "upstream": ["B1(药材基源)", "B2(提取液)"],
+          "external": ["PubChem/ChemSpider结构库", "GNPS分子网络"],
+          "schema": "compound_name, pubchem_cid, smiles, content_mg_g, category, ms_ms_spectrum"
+        },
+        "processing": {
+          "aiRules": ["匹配PubChem → auto_identify", "定量RSD<10% → auto_quantify", "无匹配 → flag_human"],
+          "models": ["GNPS分子网络", "MS/MS谱库匹配"]
+        },
+        "output": {
+          "toDownstream": ["C1(成分→靶点预测的输入)", "C2(分子对接的输入)", "F3(PK检测成分)"],
+          "toKnowledge": ["L2: Compound节点 + SMILES + content + category属性"]
+        }
+      },
+      "virtualData_summary": {
+        "identified": 35, "quantified": 15, "totalRecords": 90,
+        "categories": {"异黄酮": 4, "黄酮": 5, "生物碱": 4, "三萜皂苷": 1, "查耳酮": 1},
+        "confidence": 0.98
+      }
+    },
+    {
+      "id": "C1",
+      "phase": "靶点",
+      "name": "网络药理学靶点预测",
+      "question": "15个成分→多少靶点→与DKD交集多大？",
+      "goal": "识别GQD干预DKD的核心靶点群，构建成分-靶点-疾病网络",
+      "experiment": "15成分→SwissTargetPrediction/SEA/TCMSP靶点预测 → DKD疾病靶点交集 → PPI网络拓扑分析",
+      "dataType": "网络数据",
+      "dataSummary": "15成分×预测靶点(平均40个)=600对 → 去重386靶点 → DKD交集72个 → Top15核心靶点",
+      "passRule": {"metric": "命中≥3个已验证DKD核心靶点", "autoTrigger": false, "reason": "需人审确认靶点清单避免幻觉"},
+      "status": "approved",
+      "aiRole": "网络构建/拓扑分析/核心靶点排序全自动",
+      "humanRole": "核心靶点清单确认（H1审核节点）",
+      "reviewGate": "H1",
+      "ports": {
+        "input": {
+          "upstream": ["B3(15个定量成分SMILES)"],
+          "external": ["SwissTargetPrediction API", "SEA", "TCMSP", "GeneCards(DKD)", "OMIM", "DisGeNET"],
+          "schema": "compound_smiles, target_gene, prediction_score, source_db"
+        },
+        "processing": {
+          "aiRules": ["至少3个数据库命中 → high_confidence", "PPI degree Top10% → hub_gene", "仅1个来源 → flag_moderate"],
+          "models": ["StringDB PPI网络", "CytoHubba拓扑分析", "多源靶点融合(评分加权)"]
+        },
+        "output": {
+          "toDownstream": ["C2(Top靶点做分子对接)", "D1(靶点指导体外验证指标选择)"],
+          "toKnowledge": ["L2: Target节点 + compound-target边 + target-disease边 + pathway归属"],
+          "feedbackReceiver": "E1发现新通路时可触发target重排序"
+        }
+      },
+      "virtualData_summary": {
+        "totalPredictedTargets": 386, "diseaseIntersection": 72, "topTargets": 15,
+        "pathways": 5, "validatedTargets": 10, "flaggedNewTargets": 2,
+        "confidence": 0.88
+      }
+    },
+    {
+      "id": "C2",
+      "phase": "靶点",
+      "name": "分子对接与动力学验证",
+      "question": "Top成分与核心靶点的结合模式和亲和力如何？",
+      "goal": "验证Top成分与核心靶点的结合能力，锁定关键药效物质",
+      "experiment": "AutoDock Vina对接 + 100ns MD动力学验证(GROMACS)",
+      "dataType": "计算数据",
+      "dataSummary": "Top10成分×10靶点=100对对接 + Top20复合物100ns MD = 100条对接记录 + 20条MD记录",
+      "passRule": {"metric": "Top5成分结合能<-7 kcal/mol", "autoTrigger": true},
+      "status": "approved",
+      "aiRole": "对接/MD/结合自由能(MM-GBSA)计算全自动",
+      "humanRole": "结合模式合理性审查",
+      "reviewGate": "H1",
+      "ports": {
+        "input": {
+          "upstream": ["C1(Top15靶点)", "B3(成分SMILES)"],
+          "external": ["PDB蛋白结构库", "AlphaFold预测结构"],
+          "schema": "compound, target_pdb, dockscore, mmgbsa, hbonds, rmsd_md"
+        },
+        "processing": {
+          "aiRules": ["dockScore<-7 → pass", "MM-GBSA<-25 → stable", "RMSD<2Å during MD → converged"],
+          "models": ["AutoDock Vina", "GROMACS MD", "MM-GBSA"]
+        },
+        "output": {
+          "toDownstream": ["D1(关键药效物质指导体外验证浓度)"],
+          "toKnowledge": ["L2: compound-target边 + binding_affinity属性 + md_converged布尔"]
+        }
+      },
+      "virtualData_summary": {
+        "totalPairs": 100, "mdValidated": 20, "topBindings": 7,
+        "avgTop5DockScore": -8.46, "allPassed": true,
+        "confidence": 0.85
+      }
+    },
+    {
+      "id": "C3",
+      "phase": "靶点",
+      "name": "虚拟ADME/T评估",
+      "question": "主要成分的药代可行性和潜在毒性如何？",
+      "goal": "评估15个主要成分的药代性质，标记风险成分",
+      "experiment": "SwissADME + pkCSM + vNN-ADMET预测",
+      "dataType": "计算数据",
+      "dataSummary": "15成分×12项ADME/T参数 = 180条预测记录",
+      "passRule": {"metric": "≥5个成分满足Lipinski+OB>30%", "autoTrigger": true},
+      "status": "approved",
+      "aiRole": "ADME预测全自动化",
+      "humanRole": "毒性预警判定",
+      "reviewGate": "H2",
+      "ports": {
+        "input": {
+          "upstream": ["B3(成分SMILES)"],
+          "external": ["SwissADME", "pkCSM", "vNN-ADMET", "Tox21"],
+          "schema": "compound, OB_pct, DL, lipinski_pass, caco2, bbb, herg_risk, tox_flags"
+        },
+        "processing": {
+          "aiRules": ["Lipinski pass + OB>30% → drug_like", "hERG IC50<10μM → cardiac_risk_flag", "OB<10% → low_exposure_flag → feedback F3"],
+          "models": ["SwissADME (Lipinski/Veber)", "pkCSM (12项PK预测)", "vNN-ADMET (毒性预测)"]
+        },
+        "output": {
+          "toDownstream": ["F3(PK需验证低OB成分)", "G1(药代性质维度)"],
+          "toKnowledge": ["L2: Compound节点 + adme属性 + risk_flag边"],
+          "feedbackTrigger": "低OB成分 → 触发F3 PK验证回路"
+        }
+      },
+      "virtualData_summary": {
+        "compounds": 15, "drugLike": 5, "flagged": 2,
+        "berberineFlag": "OB仅5.8% → 低暴露风险 → 触发FB7",
+        "glycyrrhizicFlag": "OB极低+MW>500 → 可能肠道代谢",
+        "confidence": 0.80
+      }
+    },
+    {
+      "id": "D1",
+      "phase": "药效",
+      "name": "体外药效验证（HK-2细胞·全标志物panel）",
+      "question": "GQD对高糖诱导肾小管纤维化的6大通路panel是否均有抑制？",
+      "goal": "验证GQD对纤维化/炎症/氧化应激/自噬/代谢/细胞功能的全面保护",
+      "experiment": "HK-2细胞高糖(30mM)模型 + GQD含药血清(3浓度×3时间) + 6大panel(~45指标)",
+      "dataType": "实验数据",
+      "dataSummary": "6组×45指标×3重复 = 810条体外药效数据点；覆盖6大通路完整panel",
+      "passRule": {"metric": "核心标志物(TGF-β/Col-IV/IL-6/NLRP3)↓≥30% p<0.05", "autoTrigger": false},
+      "status": "approved",
+      "aiRole": "灰度分析/统计/可视化/通路热图绘制自动化",
+      "humanRole": "实验方案设计、WB读图（仅争议数据）",
+      "reviewGate": "H2",
+      "ports": {
+        "input": {
+          "upstream": ["C1(靶点指导指标选择)", "C2(关键药效物质指导浓度)"],
+          "external": ["HG细胞模型标准方案"],
+          "schema": "group, timepoint, marker, value, unit, p_value, pathway"
+        },
+        "processing": {
+          "aiRules": ["核心标志物↓≥30% p<0.05 → pass", "非核心标志物记录但不影响决策", "矛盾数据(不同时间点反向) → flag"],
+          "models": ["ANOVA+TukeyHSD", "通路活性评分(pathway score)", "层次聚类热图"]
+        },
+        "output": {
+          "toDownstream": ["D2(体外基线供类器官对比)", "E1(标志物指导组学解读)", "G1(有效性体外维度)"],
+          "toKnowledge": ["L2: Marker节点 + group-marker值边 + pathway归属"]
+        }
+      },
+      "virtualData_summary": {
+        "groups": 6, "markers": 45, "timepoints": 3, "totalRecords": 810,
+        "panels": {
+          "纤维化(EMT)": ["TGF-β1", "Col-IV", "Fibronectin", "α-SMA", "Vimentin", "N-cadherin", "E-cadherin", "Snail", "Slug", "Twist"],
+          "炎症": ["IL-6", "TNF-α", "MCP-1", "NLRP3", "IL-1β", "ASC", "Caspase-1", "NF-κB p65", "p-IκBα", "COX-2"],
+          "氧化应激": ["ROS", "MDA", "SOD", "GSH", "GSSG", "Nrf2", "HO-1", "NQO1", "CAT", "GCLC"],
+          "自噬": ["LC3-II/I", "p62", "Beclin-1", "mTOR", "p-mTOR", "ULK1", "Atg5", "Atg7"],
+          "代谢": ["GLUT1", "GLUT4", "AMPK", "p-AMPK", "ACC", "脂滴", "SREBP-1c"],
+          "细胞功能": ["CCK-8活力", "线粒体膜电位", "Caspase-3凋亡", "Bcl-2", "Bax"]
+        },
+        "keyResults": {
+          "TGF-β1_H_↓%": 60.5, "Col-IV_H_↓%": 61.9, "IL-6_H_↓%": 55.2,
+          "NLRP3_H_↓%": 48.3, "ROS_H_↓%": 52.0, "LC3BII/I_H_恢复%": 90.0
+        },
+        "confidence": 0.90, "pValue": "<0.001"
+      }
+    },
+    {
+      "id": "D2",
+      "phase": "药效",
+      "name": "类器官芯片药效（肾类器官·多读数3D验证）",
+      "question": "3D类器官条件下药效是否与2D一致？是否揭示2D不可见的表型？",
+      "goal": "在更高生理相关度下验证GQD抗纤维化效果，捕获3D特异指标",
+      "experiment": "人iPSC来源肾类器官 + 高糖+AGEs微环境 + GQD(30μg/mL) + UC类器官芯片3.0 + 72h连续监测",
+      "dataType": "芯片数据",
+      "dataSummary": "3组×8指标×6时间点连续 = 144条3D药效记录 + 芯片传感器实时数据",
+      "passRule": {"metric": "与D1核心标志物一致性>70%", "autoTrigger": false},
+      "status": "approved",
+      "aiRole": "芯片数据采集/形态AI分析/传感器时序对齐",
+      "humanRole": "类器官质量控制、芯片操作",
+      "reviewGate": "H2",
+      "ports": {
+        "input": {
+          "upstream": ["D1(2D基线对比)"],
+          "external": ["UC类器官芯片3.0硬件", "iPSC肾类器官培养方案"],
+          "schema": "group, timepoint_h, marker, value, sensor_channel"
+        },
+        "processing": {
+          "aiRules": ["一致性>70% → pass", "3D特异新表型 → flag_for_E1", "传感器异常 → flag"],
+          "models": ["类器官形态AI(CNN)", "时序传感器分析", "2D-3D一致性评分"]
+        },
+        "output": {
+          "toDownstream": ["E1(3D特异发现指导组学)", "G1(有效性体外3D验证维度)"],
+          "toKnowledge": ["L2: 3D_Assay节点 + 2D-3D consistency边"]
+        }
+      },
+      "virtualData_summary": {
+        "groups": 3, "markers": 8, "timepoints": 6, "totalRecords": 144,
+        "keyResults": {
+          "KIM-1_3D_↓%": 59.6, "KIM-1_2D_↓%": 45.2, "3D_more_sensitive": true,
+          "fibronectin_3D_↓%": 60.0, "barrierResistance_recover_h": 36,
+          "consistencyWithD1": 0.82
+        },
+        "aiInsight": "3D模型对早期损伤标志物KIM-1更敏感(↓59.6% vs 2D↓45.2%)",
+        "confidence": 0.85
+      }
+    },
+    {
+      "id": "E1",
+      "phase": "机制",
+      "name": "多组学整合引擎（从验证→预测发现）",
+      "question": "GQD通过什么多组学网络调控DKD？是否有新通路发现驱动反馈？",
+      "goal": "系统揭示GQD干预DKD的多组学调控网络，驱动C1靶点重排序（AI4S核心区别）",
+      "experiment": "db/db DKD小鼠肾皮质 + GQD(3剂量)×(0/4/8周) → 转录组+蛋白组+代谢组+单细胞+16S 五组学",
+      "dataType": "组学数据",
+      "dataSummary": "转录组2847 DEG + 蛋白组638 DEP + 代谢组156 DAM + 单细胞5型 × ~20marker + 微生物100 OTU = 多组学矩阵",
+      "passRule": {"metric": "调控通路命中DKD通路集 + 多组学一致性≥0.4", "autoTrigger": false},
+      "status": "approved",
+      "aiRole": "组学pipeline/通路富集/MOFA多组学整合/因果推断/新通路预测",
+      "humanRole": "新通路发现的科学合理性判断（H3审核）",
+      "reviewGate": "H3",
+      "ports": {
+        "input": {
+          "upstream": ["D1(标志物指导组学解读)", "D2(3D特异发现)"],
+          "external": ["KEGG/Reactome通路库", "MOFA数据库"],
+          "schema": "omics_type, gene_protein_metabolite, log2FC, p_adj, pathway, timepoint"
+        },
+        "processing": {
+          "aiRules": [
+            "多组学一致性(转录-蛋白相关r≥0.4) → high_confidence",
+            "通路≥3组学命中 → validated_pathway",
+            "仅单组学命中 + 文献无报道 → novel_pathway → 触发C1反馈"
+          ],
+          "models": ["DESeq2/Limma差异分析", "MOFA多组学因子分析", "因果推断(DoWhy)", "时间序列轨迹分析"],
+          "ai4sDifferentiator": "传统路径只做验证；AI4S路径用组学做预测和发现，驱动反馈回路"
+        },
+        "output": {
+          "toDownstream": ["F1(机制指导体内剂量)", "G1(机制明确性维度)"],
+          "toKnowledge": ["L2: 通路节点 + 组学证据边 + 因果关系边 + 新发现标记"],
+          "feedbackTrigger": "novel_pathway → 触发FB3 → C1靶点重排序"
+        }
+      },
+      "virtualData_summary": {
+        "transcriptomics": {"DEG": 2847, "up": 1523, "down": 1324, "topPathways": 5},
+        "proteomics": {"DEP": 638, "keyDown": 4, "keyUp": 3},
+        "metabolomics": {"DAM": 156, "keyChanged": 3},
+        "singleCell": {"cellTypes": 5, "markersPerType": 20},
+        "microbiome": {"OTU": 100},
+        "totalRecords": "~36000组学数据点",
+        "novelPathway": {"name": "溶血磷脂酰胆碱-脂毒性轴", "evidence": "moderate", "feedbackTriggered": "FB3→C1"},
+        "multiOmicsConsistency": 0.48,
+        "confidence": 0.88
+      }
+    },
+    {
+      "id": "F1",
+      "phase": "体内",
+      "name": "体内药效验证（db/db小鼠·完整指标体系）",
+      "question": "体内是否有明确疗效、量效关系，是否优于阳性药？",
+      "goal": "确认GQD在DKD动物模型中的疗效、最优剂量和全面药效谱",
+      "experiment": "db/db DKD小鼠 + GQD(0.5/1.0/2.0 g/kg/d)灌胃12周 + 阳性药缬沙坦 + 6组×10只",
+      "dataType": "动物实验数据",
+      "dataSummary": "6组×10只×~30指标 = ~1800条体内药效记录（肾功能/病理/分子/代谢/全身毒性）",
+      "passRule": {"metric": "UACR↓≥25% p<0.05；量效关系明确", "autoTrigger": false},
+      "status": "approved",
+      "aiRole": "数据统计/量效曲线拟合/病理图像AI定量",
+      "humanRole": "给药方案、毒性分级判定",
+      "reviewGate": "H3",
+      "ports": {
+        "input": {
+          "upstream": ["E1(机制指导剂量设计)"],
+          "external": ["db/db小鼠模型标准", "动物伦理审批"],
+          "schema": "group, animal_id, week, indicator, value, unit, tissue"
+        },
+        "processing": {
+          "aiRules": ["UACR↓≥25% p<0.05 → pass", "量效R²>0.85 → dose_response_confirmed", "优于阳性药 → superiority_flag"],
+          "models": ["ANOVA", "Emax量效模型", "病理图像AI分割(PAS/Masson纤维化定量)"]
+        },
+        "output": {
+          "toDownstream": ["F2(高剂量组供安全评估)", "G1(有效性体内维度)"],
+          "toKnowledge": ["L2: InVivo节点 + dose-response曲线 + efficacy属性"]
+        }
+      },
+      "virtualData_summary": {
+        "groups": 6, "animalsPerGroup": 10, "indicators": 30, "totalRecords": 1800,
+        "keyResults": {
+          "UACR_H_↓%": 60.7, "UACR_vs_Valsartan": "superior",
+          "eGFR_H": 0.71, "HbA1c_H": 7.5, "mesangialScore_H": 1.4,
+          "collagenArea_H_↓%": 67.1, "doseResponseR2": 0.98
+        },
+        "optimalDose": "2.0 g/kg/d",
+        "confidence": 0.95
+      }
+    },
+    {
+      "id": "F2",
+      "phase": "安全",
+      "name": "安全性预评估",
+      "question": "主要毒性器官和NOAEL安全窗？",
+      "goal": "评估GQD的主要安全性风险，确定安全窗",
+      "experiment": "急性毒性(小鼠单次灌胃) + 重复给药毒性(大鼠90天) + hERG + 肝肾功全套",
+      "dataType": "毒理数据",
+      "dataSummary": "急毒+90天重复给药 = ~500条毒理记录（脏器系数/肝肾功/病理/血液学）",
+      "passRule": {"metric": "NOAEL > 有效剂量30倍; 无肝肾毒性", "autoTrigger": false},
+      "status": "approved",
+      "aiRole": "毒性预测/数据统计/风险分级/器官毒性AI预警",
+      "humanRole": "毒性分级判定、异常病理判定",
+      "reviewGate": null,
+      "ports": {
+        "input": {
+          "upstream": ["F1(给药剂量参考)"],
+          "external": ["OECD毒理试验指南", "ICH S7A/S7B"],
+          "schema": "dose, duration_days, organ, parameter, value, control_value, significance"
+        },
+        "processing": {
+          "aiRules": ["NOAEL/有效剂量≥30 → safe", "肝肾指标<2×正常上限 → acceptable", "ALT>3×正常上限 → DILI_risk_flag"],
+          "models": ["DILI预测模型", "hERG风险评估", "器官-剂量-时间三维热图"]
+        },
+        "output": {
+          "toDownstream": ["G1(安全性维度 + 法规维度)"],
+          "toKnowledge": ["L2: Safety节点 + NOAEL属性 + risk_flag边"],
+          "feedbackTrigger": "若出现毒性 → 触发FB5 → B1回溯药材批次"
+        }
+      },
+      "virtualData_summary": {
+        "acuteTox_LD50": ">15.0 g/kg (实际无毒)",
+        "NOAEL": "6.0 g/kg/d", "safetyMargin": "3×(6.0/2.0)",
+        "hERG_berberine_IC50": "12.5μM (low risk)",
+        "altFlag": "高剂量ALT 48 vs 35(轻度升高,正常范围内)",
+        "totalRecords": 500, "confidence": 0.82
+      }
+    },
+    {
+      "id": "F3",
+      "phase": "药代",
+      "name": "初步药代研究",
+      "question": "主要成分体内暴露量是否充足？低OB成分的体内命运？",
+      "goal": "确认关键成分的体内PK行为，验证低OB成分的肠-肾轴假说",
+      "experiment": "SD大鼠灌胃GQD 2.0g/kg + 12时间点采血 + UPLC-MS/MS检测8成分 + 肠内容物采样",
+      "dataType": "PK数据",
+      "dataSummary": "8成分×12时间点×6只 = 576条血药浓度记录 + 肠内容物48条 = 624条PK记录",
+      "passRule": {"metric": "主要成分AUC暴露充足", "autoTrigger": true},
+      "status": "approved",
+      "aiRole": "PK参数计算/曲线拟合/非房室模型(NCA)全自动",
+      "humanRole": "采样方案审定",
+      "reviewGate": null,
+      "ports": {
+        "input": {
+          "upstream": ["B3(8个检测成分)", "C3(低OB成分风险标记)"],
+          "external": ["UPLC-MS/MS仪器"],
+          "schema": "compound, time_h, concentration_ng_ml, tissue, animal_id"
+        },
+        "processing": {
+          "aiRules": ["AUC高于有效浓度阈值 → adequate", "低OB成分 → 分析肠道局部浓度", "反馈C3标记 → 解除或确认风险"],
+          "models": ["非房室模型NCA(PKNCA)", "肠-肾轴浓度梯度分析"]
+        },
+        "output": {
+          "toDownstream": ["G1(药代性质维度)"],
+          "toKnowledge": ["L2: PK节点 + AUC/Cmax/Tmax属性"],
+          "feedbackResolution": "C3标记小檗碱OB风险 → F3确认肠-肾轴 → FB7解除风险"
+        }
+      },
+      "virtualData_summary": {
+        "compounds": 8, "timepoints": 12, "animals": 6, "totalRecords": 624,
+        "keyFinding": "小檗碱血药Cmax仅12.5ng/mL但肠道滞留T1/2=8.5h → 肠-肾轴假说支持",
+        "c3FeedbackResolved": true,
+        "confidence": 0.85
+      }
+    },
+    {
+      "id": "G1",
+      "phase": "决策",
+      "name": "综合成药性评估报告（3层12维度MCDM）",
+      "question": "Go or No-Go？12维度全面评估",
+      "goal": "基于3层12维度MCDM做出Go/No-Go决策",
+      "experiment": "整合B1-F3所有数据 + 外部商业/法规/政策数据 → 3层加权评分",
+      "dataType": "决策数据",
+      "dataSummary": "12维度评分 + 敏感性分析 + Go/No-Go建议 + IND路径建议",
+      "passRule": {"metric": "L1无否决 + L2加权总分≥70/100 → Go", "autoTrigger": false},
+      "status": "approved",
+      "aiRole": "多维度评分/报告生成/敏感性分析/风险矩阵",
+      "humanRole": "最终Go/No-Go决策（H3终审）",
+      "reviewGate": "H3",
+      "ports": {
+        "input": {
+          "upstream": ["B1-F3所有切块"],
+          "external": ["专利数据库", "流行病学数据", "CDE指导原则", "医保/基药政策", "药材资源数据", "原料药价格"],
+          "schema": "dimension, score, weight, evidence, source_block, external_ref"
+        },
+        "processing": {
+          "aiRules": [
+            "L1一票否决: 任一维度<4分 → No-Go(无需看总分)",
+            "L2核心价值: 加权≥40/55 → pass核心层",
+            "L3商业价值: 加权≥20/35 → pass商业层",
+            "总分 = L2+L3 ≥70 → Go"
+          ],
+          "models": ["AHP层次分析法权重", "Monte Carlo敏感性分析", "Tornado敏感性图"]
+        },
+        "output": {
+          "toDownstream": [],
+          "toKnowledge": ["L2: Decision节点 + 12维度子节点 + Go/No-Go边"],
+          "finalSignal": "Go/No-Go → 项目状态机更新"
+        }
+      },
+      "virtualData_summary": {
+        "mcdm_tiers": {
+          "L1_veto": [
+            {"name": "安全性/毒理", "score": 7.5, "weight": "一票否决", "evidence": "F2 NOAEL安全窗3×, ALT轻度升高", "verdict": "pass(≥4)"},
+            {"name": "法规合规", "score": 8.0, "weight": "一票否决", "evidence": "符合中药1.1类要求，无禁用成分", "verdict": "pass(≥4)"}
+          ],
+          "L2_core": [
+            {"name": "有效性(体内)", "score": 8.8, "weight": 15, "weighted": 1.32, "evidence": "F1 UACR↓60.7%, 优于缬沙坦"},
+            {"name": "有效性(体外)", "score": 8.5, "weight": 10, "weighted": 0.85, "evidence": "D1/D2一致, 6大panel全面改善"},
+            {"name": "药理(机制明确性)", "score": 8.5, "weight": 10, "weighted": 0.85, "evidence": "E1 五组学+3通路+新发现+反馈驱动"},
+            {"name": "临床(终点指标)", "score": 7.5, "weight": 10, "weighted": 0.75, "evidence": "UACR/eGFR双终点可行, 需临床验证"},
+            {"name": "质量可控性", "score": 9.0, "weight": 10, "weighted": 0.90, "evidence": "B1-B3全链自动放行, 15成分定量"}
+          ],
+          "L3_commercial": [
+            {"name": "知识产权", "score": 7.0, "weight": 5, "weighted": 0.35, "evidence": "已有相关专利布局, 需补充处方专利"},
+            {"name": "市场需求", "score": 8.5, "weight": 7, "weighted": 0.60, "evidence": "DKD全球2亿患者, 中药1.1类竞争少"},
+            {"name": "生产成本", "score": 8.5, "weight": 5, "weighted": 0.43, "evidence": "4味药材成本低, 工艺简单(B2)"},
+            {"name": "炮制/制剂", "score": 8.0, "weight": 5, "weighted": 0.40, "evidence": "传统汤剂→现代制剂可行"},
+            {"name": "药材资源", "score": 8.5, "weight": 4, "weighted": 0.34, "evidence": "4味药材均大宗, 可持续"},
+            {"name": "政策", "score": 9.0, "weight": 5, "weighted": 0.45, "evidence": "中药1.1类优先审评, 医保支持"},
+            {"name": "药物经济", "score": 8.0, "weight": 4, "weighted": 0.32, "evidence": "成本效果比预期优势明显"}
+          ]
+        },
+        "totalScore": 85.6,
+        "L1_verdict": "pass(无一票否决)",
+        "L2_coreScore": 46.7,
+        "L3_commercialScore": 38.9,
+        "decision": "GO",
+        "sensitivity": "在-10%扰动下总分仍76.4(>70)，决策稳健",
+        "recommendation": "建议按中药1.1类新药推进IND申报；重点：肝功能监测、小檗碱肠-肾轴机制深入、溶血磷脂酰胆碱新通路验证",
+        "confidence": 0.88
+      }
+    }
+  ],
+  "reviewGates": [
+    {
+      "id": "H1",
+      "name": "质量-靶点双重审核",
+      "afterBlock": "C2",
+      "question": "药材→工艺→成分→靶点链是否可控？核心靶点清单是否科学？",
+      "aiAssessment": "B1(RSD<5%✓)→B2(转移率>70%✓)→B3(定量15✓)→C1(10+靶点✓)→C2(结合能✓)，全链通过",
+      "humanDecision": "Approved",
+      "status": "passed",
+      "timestamp": "2026-07-06T10:30:00+08:00",
+      "notes": "4味药材质量稳定，工艺可行，成分清晰，靶点网络成立。H1审核通过。C1标记的MMP9/LC3B需后续验证。"
+    },
+    {
+      "id": "H2",
+      "name": "成药潜力审核",
+      "afterBlock": "D2",
+      "question": "靶点→结合→体外药效(6大panel)→3D验证链是否成立？",
+      "aiAssessment": "C2(✓)→D1(45指标全面改善✓)→D2(一致性82%✓)。注意C3小檗碱OB低风险待F3验证",
+      "humanDecision": "Approved",
+      "status": "passed",
+      "timestamp": "2026-07-06T14:15:00+08:00",
+      "notes": "6大通路panel全面改善，3D类器官一致性82%。小檗碱OB风险需F3 PK验证。H2审核通过。"
+    },
+    {
+      "id": "H3",
+      "name": "科学合理性与Go/No-Go终审",
+      "afterBlock": "G1",
+      "question": "五组学+体内+安全+PK全链是否成立？Go or No-Go？",
+      "aiAssessment": "E1(五组学✓)→F1(UACR↓60.7%,优于阳性药✓)→F2(安全窗3×✓)→F3(暴露充足✓)→G1(85.6分>70✓)",
+      "humanDecision": "Approved - GO",
+      "status": "passed",
+      "timestamp": "2026-07-06T18:00:00+08:00",
+      "notes": "五组学机制完整，疗效明确优于阳性药，安全性可接受。总分85.6。决策GO，推进IND。"
+    }
+  ],
+  "feedbackLoops": [
+    {"id": "FB1", "from": "D1", "to": "C2", "condition": "体外药效阴性(核心标志物↓<30%)", "status": "not_triggered", "note": "D1全面阳性，未触发"},
+    {"id": "FB2", "from": "D2", "to": "D1", "condition": "3D/2D一致性<70%", "status": "not_triggered", "note": "一致性82%，未触发"},
+    {"id": "FB3", "from": "E1", "to": "C1", "condition": "组学发现新通路→靶点重排序", "status": "triggered", "note": "E1发现溶血磷脂酰胆碱-脂毒性轴→已标注待验证→C1靶点待重排序", "resolvedBy": "标记为新发现，下一迭代验证"},
+    {"id": "FB4", "from": "F1", "to": "D1", "condition": "体内/体外剂量比例不合理", "status": "not_triggered", "note": "体内有效剂量与体外浓度比例合理"},
+    {"id": "FB5", "from": "F2", "to": "B1", "condition": "出现毒性需回溯药材批次", "status": "not_triggered", "note": "无显著毒性"},
+    {"id": "FB6", "from": "G1", "to": "any", "condition": "No-Go触发根因分析", "status": "not_triggered", "note": "Go决策，未触发"},
+    {"id": "FB7", "from": "F3", "to": "C3", "condition": "PK验证低OB成分体内命运", "status": "resolved", "note": "C3标记小檗碱OB风险→F3确认肠道局部有效→风险解除"}
+  ],
+  "dataLineage": {
+    "description": "数据血缘追踪——每条数据从产生到决策的完整路径",
+    "example": {
+      "dataPoint": "G1 有效性(体内) 8.8分",
+      "lineage": "B1(药材批次)→B2(提取)→B3(成分定量)→C1(靶点)→C2(对接)→D1(体外45指标)→D2(3D)→E1(五组学)→F1(UACR↓60.7%)→G1(score=8.8)",
+      "provenance": "F1动物实验原始数据 → AI统计 → 评分 → 人审确认",
+      "confidenceChain": "0.95(F1) × 0.90(D1) × 0.88(E1) = 0.75 综合置信度"
+    }
+  }
+}
